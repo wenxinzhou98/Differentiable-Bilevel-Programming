@@ -12,6 +12,7 @@
 // Original Python author: Jiayang Li
 
 #include <Eigen/Dense>
+#include <Eigen/Sparse>
 #include <gurobi_c++.h>
 
 #include <algorithm>
@@ -112,9 +113,9 @@ struct Network {
     map<OD, map<Path, int>> path_id; // (o,d) -> { path -> column index }
     vector<int>              path2od; // column k -> OD row index
 
-    // Dense Eigen matrices (populated by generate_sparse_matrix)
-    MatrixXd path_edge;   // [n_links x n_paths]
-    MatrixXd path_demand; // [n_OD   x n_paths]
+    // Eigen sparse matrices (populated by generate_sparse_matrix)
+    SparseMatrix<double> path_edge;   // [n_links x n_paths]
+    SparseMatrix<double> path_demand; // [n_OD   x n_paths]
 
     // Demand dictionary (stored for warm-start access inside GP)
     map<OD, double> demand_dict;
@@ -497,17 +498,28 @@ void path_enumeration(Network& net) {
 // ============================================================
 // generate_sparse_matrix  (from graph.py)
 // Fills net.path_edge [n_links x n_paths] and
-//       net.path_demand [n_OD   x n_paths] as dense Eigen matrices.
-// (Python uses PyTorch sparse tensors; C++ uses Eigen dense matrices.)
+//       net.path_demand [n_OD   x n_paths] as Eigen sparse matrices.
+// (Mirrors PyTorch sparse tensor construction from index lists in graph.py.)
+// Uses Triplet-based construction for efficient batch insertion.
 // ============================================================
 void generate_sparse_matrix(Network& net) {
-    net.path_edge   = MatrixXd::Zero(net.numberoflink, net.numberofpath);
-    net.path_demand = MatrixXd::Zero(net.numberofod,   net.numberofpath);
+    using T = Triplet<double>;
 
+    // path_edge: entry (link_row, path_col) = 1  for each link on each path
+    vector<T> edge_triplets;
+    edge_triplets.reserve(net.path_edge_lk.size());
     for (size_t i = 0; i < net.path_edge_lk.size(); ++i)
-        net.path_edge(net.path_edge_lk[i], net.path_edge_kindex[i]) = 1.0;
+        edge_triplets.emplace_back(net.path_edge_lk[i], net.path_edge_kindex[i], 1.0);
+    net.path_edge.resize(net.numberoflink, net.numberofpath);
+    net.path_edge.setFromTriplets(edge_triplets.begin(), edge_triplets.end());
+
+    // path_demand: entry (OD_row, path_col) = 1  for the OD pair each path serves
+    vector<T> demand_triplets;
+    demand_triplets.reserve(net.path_demand_odindex.size());
     for (size_t i = 0; i < net.path_demand_odindex.size(); ++i)
-        net.path_demand(net.path_demand_odindex[i], net.path_demand_kindex[i]) = 1.0;
+        demand_triplets.emplace_back(net.path_demand_odindex[i], net.path_demand_kindex[i], 1.0);
+    net.path_demand.resize(net.numberofod, net.numberofpath);
+    net.path_demand.setFromTriplets(demand_triplets.begin(), demand_triplets.end());
 }
 
 // ============================================================
@@ -556,14 +568,23 @@ vector<int> find_linearly_independent_columns(const MatrixXd& A) {
 //           p = res.x;  inds = (p > 0)
 //
 // Solves:  min  0
-//          s.t. A_eq * p == b_eq
+//          s.t. [path_edge  ] * p == x           (link flow conservation)
+//               [path_demand] * p == demand_vec  (OD demand satisfaction)
 //               p >= 0
+//
+// Constraints are built by iterating sparse non-zeros via InnerIterator,
+// avoiding materialisation of the full dense A_eq matrix.
 // Returns the optimal p vector (zeros if infeasible).
 // ============================================================
-VectorXd solve_lp_active_paths(const MatrixXd& A_eq,
-                                const VectorXd& b_eq,
-                                int             n_paths)
+VectorXd solve_lp_active_paths(const SparseMatrix<double>& path_edge,
+                                const SparseMatrix<double>& path_demand,
+                                const VectorXd&             x,
+                                const VectorXd&             demand_vec,
+                                int                         n_paths)
 {
+    int n_links = (int)x.size();
+    int n_OD    = (int)demand_vec.size();
+
     GRBEnv env = GRBEnv(true);
     env.set(GRB_IntParam_OutputFlag, 0);
     env.start();
@@ -575,14 +596,25 @@ VectorXd solve_lp_active_paths(const MatrixXd& A_eq,
         p[j] = model.addVar(0.0, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
     model.update();
 
-    // Equality constraints: A_eq * p == b_eq
-    int n_rows = (int)A_eq.rows();
-    for (int i = 0; i < n_rows; ++i) {
-        GRBLinExpr expr;
-        for (int j = 0; j < n_paths; ++j)
-            expr += A_eq(i, j) * p[j];
-        model.addConstr(expr == b_eq(i));
+    // Pre-allocate one linear expression per constraint row
+    vector<GRBLinExpr> link_expr(n_links), od_expr(n_OD);
+
+    // Accumulate coefficients by iterating sparse non-zeros column-by-column.
+    // SparseMatrix<double> is column-major by default, so InnerIterator over
+    // column j is maximally cache-friendly.
+    for (int j = 0; j < n_paths; ++j) {
+        for (SparseMatrix<double>::InnerIterator it(path_edge, j); it; ++it)
+            link_expr[it.row()] += it.value() * p[j];
+        for (SparseMatrix<double>::InnerIterator it(path_demand, j); it; ++it)
+            od_expr[it.row()] += it.value() * p[j];
     }
+
+    // Add equality constraints: path_edge * p == x
+    for (int i = 0; i < n_links; ++i)
+        model.addConstr(link_expr[i] == x(i));
+    // Add equality constraints: path_demand * p == demand_vec
+    for (int i = 0; i < n_OD; ++i)
+        model.addConstr(od_expr[i] == demand_vec(i));
 
     // Minimise zero (feasibility LP)
     model.set(GRB_IntAttr_ModelSense, GRB_MINIMIZE);
@@ -597,12 +629,16 @@ VectorXd solve_lp_active_paths(const MatrixXd& A_eq,
 }
 
 // ============================================================
-// Helper: extract a subset of columns from a matrix
+// Helper: extract a subset of columns from a sparse matrix into a dense matrix.
+// The result is MatrixXd because the extracted active-path submatrices (path_edge_i,
+// path_demand_i) are small and used exclusively in dense operations downstream.
+// InnerIterator visits only non-zeros, so zero-initialisation of result is correct.
 // ============================================================
-MatrixXd extract_columns(const MatrixXd& M, const vector<int>& cols) {
-    MatrixXd result(M.rows(), (int)cols.size());
+MatrixXd extract_columns(const SparseMatrix<double>& M, const vector<int>& cols) {
+    MatrixXd result = MatrixXd::Zero(M.rows(), (int)cols.size());
     for (int i = 0; i < (int)cols.size(); ++i)
-        result.col(i) = M.col(cols[i]);
+        for (SparseMatrix<double>::InnerIterator it(M, cols[i]); it; ++it)
+            result(it.row(), i) = it.value();
     return result;
 }
 
@@ -692,10 +728,10 @@ void run_sctp_sab(Network&                net,
 
             int path_number = net.path_number;
 
-            // path_edge   [n_links x n_paths]  — dense
-            // path_demand [n_OD   x n_paths]
-            const MatrixXd& path_edge   = net.path_edge;
-            const MatrixXd& path_demand = net.path_demand;
+            // path_edge   [n_links x n_paths]  — sparse
+            // path_demand [n_OD   x n_paths]  — sparse
+            const SparseMatrix<double>& path_edge   = net.path_edge;
+            const SparseMatrix<double>& path_demand = net.path_demand;
 
             auto tic2 = chrono::high_resolution_clock::now();
 
@@ -705,17 +741,10 @@ void run_sctp_sab(Network&                net,
                 x(i) = net.flow.at(net.Link_list[i]);
 
             // 4. Solve LP to find active paths (p > 0)
-            //    A_eq = [path_edge; path_demand]   [(n_links+n_OD) x n_paths]
-            //    b_eq = [x; demand]
-            MatrixXd A_eq(n_links + n_OD, path_number);
-            A_eq.topRows(n_links) = path_edge;
-            A_eq.bottomRows(n_OD) = path_demand;
-
-            VectorXd b_eq(n_links + n_OD);
-            b_eq.head(n_links) = x;
-            b_eq.tail(n_OD)    = demand_vec;
-
-            VectorXd p = solve_lp_active_paths(A_eq, b_eq, path_number);
+            //    min 0  s.t.  path_edge*p == x,  path_demand*p == demand_vec,  p >= 0
+            //    Constraints built from sparse non-zeros; no dense A_eq materialised.
+            VectorXd p = solve_lp_active_paths(
+                path_edge, path_demand, x, demand_vec, path_number);
 
             // Collect active path column indices (p > 0)
             vector<int> inds;
