@@ -574,9 +574,12 @@ vector<int> find_linearly_independent_columns(const MatrixXd& A) {
 //
 // Constraints are built by iterating sparse non-zeros via InnerIterator,
 // avoiding materialisation of the full dense A_eq matrix.
-// Returns the optimal p vector (zeros if infeasible).
+// env is passed by reference and reused across calls (created once in
+// run_sctp_sab) to avoid per-call licence-check overhead.
+// Returns the optimal p vector (zeros and a warning if the LP fails).
 // ============================================================
-VectorXd solve_lp_active_paths(const SparseMatrix<double>& path_edge,
+VectorXd solve_lp_active_paths(GRBEnv&                     env,
+                                const SparseMatrix<double>& path_edge,
                                 const SparseMatrix<double>& path_demand,
                                 const VectorXd&             x,
                                 const VectorXd&             demand_vec,
@@ -585,10 +588,12 @@ VectorXd solve_lp_active_paths(const SparseMatrix<double>& path_edge,
     int n_links = (int)x.size();
     int n_OD    = (int)demand_vec.size();
 
-    GRBEnv env = GRBEnv(true);
-    env.set(GRB_IntParam_OutputFlag, 0);
-    env.start();
     GRBModel model(env);
+
+    // Loosen feasibility tolerance to absorb floating-point drift that
+    // accumulates in GP link-flow updates (flow[l] += add_flow repeated many
+    // times).  Gurobi's default 1e-6 is too tight for flows computed this way.
+    model.set(GRB_DoubleParam_FeasibilityTol, 1e-4);
 
     // Decision variables: p[j] >= 0, objective coefficient = 0
     vector<GRBVar> p(n_paths);
@@ -620,10 +625,14 @@ VectorXd solve_lp_active_paths(const SparseMatrix<double>& path_edge,
     model.set(GRB_IntAttr_ModelSense, GRB_MINIMIZE);
     model.optimize();
 
+    int status = model.get(GRB_IntAttr_Status);
     VectorXd result = VectorXd::Zero(n_paths);
-    if (model.get(GRB_IntAttr_Status) == GRB_OPTIMAL) {
+    if (status == GRB_OPTIMAL) {
         for (int j = 0; j < n_paths; ++j)
             result(j) = p[j].get(GRB_DoubleAttr_X);
+    } else {
+        cerr << "[solve_lp_active_paths] Gurobi status = " << status
+             << " (not optimal); returning zero vector." << endl;
     }
     return result;
 }
@@ -691,6 +700,13 @@ void run_sctp_sab(Network&                net,
     int n_links = params.n_links;
     int n_OD    = params.n_OD;
 
+    // Create Gurobi environment once for all LP solves in this run.
+    // Avoids per-call licence-check overhead and prevents occasional
+    // initialisation failures when GRBEnv is constructed inside a tight loop.
+    GRBEnv grb_env = GRBEnv(true);
+    grb_env.set(GRB_IntParam_OutputFlag, 0);
+    grb_env.start();
+
     // Pre-compute UE and SO total travel times  (from sctp_sab.py top of loop)
     double TT_ue = total_travel_time(x_ue, tfree, cap);
     double TT_so = total_travel_time(x_so, tfree, cap);
@@ -744,7 +760,7 @@ void run_sctp_sab(Network&                net,
             //    min 0  s.t.  path_edge*p == x,  path_demand*p == demand_vec,  p >= 0
             //    Constraints built from sparse non-zeros; no dense A_eq materialised.
             VectorXd p = solve_lp_active_paths(
-                path_edge, path_demand, x, demand_vec, path_number);
+                grb_env, path_edge, path_demand, x, demand_vec, path_number);
 
             // Collect active path column indices (p > 0)
             vector<int> inds;
