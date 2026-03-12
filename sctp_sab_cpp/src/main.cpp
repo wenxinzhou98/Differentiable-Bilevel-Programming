@@ -31,36 +31,60 @@ static double total_travel_time(const Eigen::VectorXd& x,
     return tt;
 }
 
-// Find linearly independent columns using Gurobi LP
-// Solve: min 0^T f  s.t. A_eq * f = b_eq, f >= 0
-// Return indices where f > 0 (basic variables = linearly independent columns)
+// Find linearly independent columns using Gurobi LP.
+// Directly iterates sparse matrix non-zeros — no dense conversion needed.
+// Solves: min 0^T f  s.t. [path_edge; path_demand] * f = [x; demand], f >= 0
+// Returns boolean mask where f > 0 (basic variables = linearly independent columns).
 static std::vector<bool> find_independent_paths_gurobi(
-        const Eigen::MatrixXd& A_eq,
-        const Eigen::VectorXd& b_eq,
+        const Eigen::SparseMatrix<double>& path_edge,
+        const Eigen::SparseMatrix<double>& path_demand,
+        const Eigen::VectorXd& x,
+        const Eigen::VectorXd& demand_vec,
         int num_paths) {
 
     GRBEnv env(true);
-    env.set(GRB_IntParam_OutputFlag, 0);  // Suppress output
+    env.set(GRB_IntParam_OutputFlag, 0);
     env.start();
 
     GRBModel model(env);
 
+    int num_links = (int)path_edge.rows();
+    int num_od = (int)path_demand.rows();
+    int num_constraints = num_links + num_od;
+
     // Add variables f_k >= 0
     std::vector<GRBVar> f(num_paths);
     for (int k = 0; k < num_paths; ++k) {
-        f[k] = model.addVar(0.0, GRB_INFINITY, 0.0, GRB_CONTINUOUS, "f_" + std::to_string(k));
+        f[k] = model.addVar(0.0, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
     }
 
-    // Add equality constraints: A_eq * f = b_eq
-    int num_constraints = (int)A_eq.rows();
+    // Build constraint expressions by iterating sparse non-zeros
+    std::vector<GRBLinExpr> constrs(num_constraints);
     for (int i = 0; i < num_constraints; ++i) {
-        GRBLinExpr expr = 0;
-        for (int k = 0; k < num_paths; ++k) {
-            if (std::abs(A_eq(i, k)) > 1e-15) {
-                expr += A_eq(i, k) * f[k];
-            }
+        constrs[i] = 0;
+    }
+
+    // path_edge contributions (rows 0..num_links-1)
+    // path_edge is column-major (Eigen default), iterate over columns
+    for (int k = 0; k < path_edge.outerSize(); ++k) {
+        for (Eigen::SparseMatrix<double>::InnerIterator it(path_edge, k); it; ++it) {
+            constrs[it.row()] += it.value() * f[it.col()];
         }
-        model.addConstr(expr == b_eq(i), "eq_" + std::to_string(i));
+    }
+
+    // path_demand contributions (rows num_links..num_links+num_od-1)
+    for (int k = 0; k < path_demand.outerSize(); ++k) {
+        for (Eigen::SparseMatrix<double>::InnerIterator it(path_demand, k); it; ++it) {
+            constrs[num_links + it.row()] += it.value() * f[it.col()];
+        }
+    }
+
+    // Add equality constraints with RHS
+    for (int i = 0; i < num_links; ++i) {
+        model.addConstr(constrs[i] == x(i));
+    }
+    for (int i = 0; i < num_od; ++i) {
+        model.addConstr(constrs[num_links + i] == demand_vec(i));
     }
 
     // Objective: min 0 (feasibility only)
@@ -83,19 +107,34 @@ static std::vector<bool> find_independent_paths_gurobi(
     return inds;
 }
 
-// Extract columns from sparse matrix by boolean mask
-static Eigen::MatrixXd extract_columns(const Eigen::SparseMatrix<double>& sp, const std::vector<bool>& mask) {
-    int n_cols = 0;
-    for (bool b : mask) if (b) n_cols++;
+// Extract columns from sparse matrix by boolean mask, returning a sparse matrix
+static Eigen::SparseMatrix<double> extract_columns_sparse(
+        const Eigen::SparseMatrix<double>& sp,
+        const std::vector<bool>& mask) {
 
-    Eigen::MatrixXd result(sp.rows(), n_cols);
-    int col = 0;
+    // Build column index mapping
+    int n_cols = 0;
+    std::vector<int> col_map(mask.size(), -1);
     for (int k = 0; k < (int)mask.size(); ++k) {
         if (mask[k]) {
-            result.col(col) = Eigen::VectorXd(sp.col(k));
-            col++;
+            col_map[k] = n_cols++;
         }
     }
+
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(sp.nonZeros());  // upper bound
+
+    for (int k = 0; k < sp.outerSize(); ++k) {
+        if (!mask[k]) continue;
+        int new_col = col_map[k];
+        for (Eigen::SparseMatrix<double>::InnerIterator it(sp, k); it; ++it) {
+            triplets.emplace_back(it.row(), new_col, it.value());
+        }
+    }
+
+    Eigen::SparseMatrix<double> result(sp.rows(), n_cols);
+    result.setFromTriplets(triplets.begin(), triplets.end());
+    result.makeCompressed();
     return result;
 }
 
@@ -217,90 +256,93 @@ int main(int argc, char* argv[]) {
 
             auto tic2 = std::chrono::high_resolution_clock::now();
 
-            // Build x (link flow vector) and demand vector
+            // Build x (link flow vector)
             Eigen::VectorXd x(Numberoflink);
             for (int i = 0; i < Numberoflink; ++i) {
                 x(i) = net.flow[Link_list[i]];
             }
 
-            // Convert sparse matrices to dense for LP and sensitivity analysis
-            Eigen::MatrixXd path_edge_dense = Eigen::MatrixXd(net.path_edge);
-            Eigen::MatrixXd path_demand_dense = Eigen::MatrixXd(net.path_demand);
-
-            // Build A_eq = [path_edge; path_demand] and b_eq = [x; demand]
-            int num_rows = Numberoflink + (int)demand_vec.size();
-            Eigen::MatrixXd A_eq(num_rows, path_number);
-            A_eq.topRows(Numberoflink) = path_edge_dense;
-            A_eq.bottomRows(demand_vec.size()) = path_demand_dense;
-
-            Eigen::VectorXd b_eq(num_rows);
-            b_eq.head(Numberoflink) = x;
-            b_eq.tail(demand_vec.size()) = demand_vec;
-
+            // ============================================================
             // Find linearly independent paths via Gurobi LP
-            auto inds = find_independent_paths_gurobi(A_eq, b_eq, path_number);
+            // Directly uses sparse matrices — no dense conversion
+            // ============================================================
+            auto inds = find_independent_paths_gurobi(
+                net.path_edge, net.path_demand, x, demand_vec, path_number);
             int n_i = 0;
             for (bool b : inds) if (b) n_i++;
 
-            // Extract independent path columns
-            Eigen::MatrixXd path_edge_i = extract_columns(net.path_edge, inds);      // |links| x n_i
-            Eigen::MatrixXd path_demand_i = extract_columns(net.path_demand, inds);   // |ODs| x n_i
+            // ============================================================
+            // Extract independent path columns as sparse matrices
+            // ============================================================
+            Eigen::SparseMatrix<double> path_edge_i = extract_columns_sparse(net.path_edge, inds);
+            Eigen::SparseMatrix<double> path_demand_i = extract_columns_sparse(net.path_demand, inds);
 
-            // Sensitivity analysis
-            // u_x = 0.15 * tfree * 4 * (x / cap)^3 / cap = 0.6 * tfree * x^3 / cap^4
+            // ============================================================
+            // Sensitivity analysis (all sparse where possible)
+            // ============================================================
+
+            // u_x = dt/dx = 0.15 * tfree * 4 * (x/cap)^3 / cap
             Eigen::VectorXd u_x(Numberoflink);
             for (int i = 0; i < Numberoflink; ++i) {
                 double ratio = x(i) / cap(i);
                 u_x(i) = 0.15 * tfree(i) * 4.0 * ratio * ratio * ratio / cap(i);
             }
 
-            // c_f = path_edge_i^T * diag(u_x) * path_edge_i   (n_i x n_i)
-            Eigen::MatrixXd diag_ux = u_x.asDiagonal();
-            Eigen::MatrixXd c_f = path_edge_i.transpose() * diag_ux * path_edge_i;
+            // c_f = path_edge_i^T * diag(u_x) * path_edge_i   (n_i x n_i, dense OK)
+            // Build sparse diagonal matrix from u_x
+            Eigen::SparseMatrix<double> diag_ux(Numberoflink, Numberoflink);
+            {
+                std::vector<Eigen::Triplet<double>> diag_triplets;
+                diag_triplets.reserve(Numberoflink);
+                for (int i = 0; i < Numberoflink; ++i) {
+                    if (std::abs(u_x(i)) > 1e-30) {
+                        diag_triplets.emplace_back(i, i, u_x(i));
+                    }
+                }
+                diag_ux.setFromTriplets(diag_triplets.begin(), diag_triplets.end());
+            }
+
+            // Sparse multiply: path_edge_i^T * diag(u_x) * path_edge_i → dense n_i x n_i
+            Eigen::SparseMatrix<double> temp_sp = path_edge_i.transpose() * diag_ux * path_edge_i;
+            Eigen::MatrixXd c_f = Eigen::MatrixXd(temp_sp);
 
             int num_od = (int)demand_vec.size();
 
-            // Build KKT Jacobian J
+            // Build KKT Jacobian J  (dense, size (n_i + num_od)^2, moderate)
             // J = [c_f, -path_demand_i^T; path_demand_i, 0]
             int J_size = n_i + num_od;
             Eigen::MatrixXd J = Eigen::MatrixXd::Zero(J_size, J_size);
             J.topLeftCorner(n_i, n_i) = c_f;
-            J.topRightCorner(n_i, num_od) = -path_demand_i.transpose();
-            J.bottomLeftCorner(num_od, n_i) = path_demand_i;
-            // bottom-right is zeros
 
-            // c_toll = jacobian of func_c_i w.r.t. toll
-            // func_c_i(toll) = path_edge_i^T * (tfree*(1+0.15*(x/cap)^4) + toll)
-            // dc_i/dtoll = path_edge_i^T * I = path_edge_i^T
-            // This is an n_i x Numberoflink matrix
-            Eigen::MatrixXd c_toll = path_edge_i.transpose();  // n_i x Numberoflink
+            // Fill path_demand_i into J (sparse → dense block, size num_od x n_i, acceptable)
+            Eigen::MatrixXd pd_i_dense = Eigen::MatrixXd(path_demand_i);
+            J.topRightCorner(n_i, num_od) = -pd_i_dense.transpose();
+            J.bottomLeftCorner(num_od, n_i) = pd_i_dense;
 
-            // Right-hand side: [-c_toll; 0]
-            Eigen::MatrixXd Right = Eigen::MatrixXd::Zero(J_size, Numberoflink);
-            Right.topRows(n_i) = -c_toll;
-
-            // Solve: J * S = Right  =>  S = J^{-1} * Right
-            Eigen::MatrixXd S = J.partialPivLu().solve(Right);
-
-            // Extract path flow sensitivity: f_toll = S[:n_i, :]
-            Eigen::MatrixXd f_toll = S.topRows(n_i);
-
-            // Link flow sensitivity: x_toll = path_edge_i * f_toll   (Numberoflink x Numberoflink)
-            Eigen::MatrixXd x_toll = path_edge_i * f_toll;
-
-            auto toc2 = std::chrono::high_resolution_clock::now();
-            inverting_time += std::chrono::duration<double>(toc2 - tic2).count();
-
-            // Compute gradient analytically (replacing PyTorch autograd)
-            // TT = sum_i x_vir_i * t_i(x_vir_i)
-            // where x_vir has forward value = x, gradient dx_vir/dtoll = x_toll
+            // ============================================================
+            // Adjoint method: compute gradient with a SINGLE linear solve
+            // instead of |links| solves.
             //
-            // dTT/dx_i = t_i(x_i) + x_i * dt_i/dx_i
-            //          = tfree_i * (1 + 0.15*(x_i/cap_i)^4) + x_i * 0.6*tfree_i*x_i^3/cap_i^4
-            //          = tfree_i * (1 + 0.15*(x_i/cap_i)^4 + 0.6*(x_i/cap_i)^4)
-            //          = tfree_i * (1 + 0.75*(x_i/cap_i)^4)
+            // Original: S = J^{-1} * Right  (Right has |links| columns)
+            //           x_toll = path_edge_i * S[:n_i,:]  (|links| x |links|)
+            //           grad = x_toll^T * dTT/dx
             //
-            // dTT/dtoll = x_toll^T * dTT/dx
+            // Adjoint:  v = path_edge_i^T * dTT/dx         (sparse x vec)
+            //           Solve J^T * y = [v; 0]             (1 solve!)
+            //           grad = -path_edge_i * y[:n_i]       (sparse x vec)
+            //
+            // Proof:  grad = x_toll^T * dTT/dx
+            //       = (Δ_I · f_toll)^T · dTT/dx
+            //       = f_toll^T · (Δ_I^T · dTT/dx)
+            //       = S[:n_i,:]^T · v
+            //       = (J^{-1} · Right)[:n_i,:]^T · v
+            //     Let w = [v; 0], then S^T · w = grad (for all columns)
+            //     S^T = Right^T · J^{-T}
+            //     grad = Right^T · J^{-T} · w = Right^T · y  where J^T y = w
+            //          = [-c_toll^T, 0] · y = -Δ_I · y[:n_i]
+            // ============================================================
+
+            // dTT/dx_i = t_i(x_i) + x_i * dt_i/dx_i = tfree_i * (1 + 0.75*(x_i/cap_i)^4)
             Eigen::VectorXd dTT_dx(Numberoflink);
             for (int i = 0; i < Numberoflink; ++i) {
                 double ratio = x(i) / cap(i);
@@ -308,7 +350,21 @@ int main(int argc, char* argv[]) {
                 dTT_dx(i) = tfree(i) * (1.0 + 0.75 * r4);
             }
 
-            Eigen::VectorXd grad_toll = x_toll.transpose() * dTT_dx;
+            // v = path_edge_i^T * dTT_dx   (sparse x vector → n_i vector)
+            Eigen::VectorXd v = Eigen::VectorXd(path_edge_i.transpose() * dTT_dx);
+
+            // w = [v; 0]
+            Eigen::VectorXd w = Eigen::VectorXd::Zero(J_size);
+            w.head(n_i) = v;
+
+            // Solve J^T * y = w   (single linear solve, size n_i + num_od)
+            Eigen::VectorXd y = J.transpose().partialPivLu().solve(w);
+
+            // grad = -path_edge_i * y[:n_i]   (sparse x vector → |links| vector)
+            Eigen::VectorXd grad_toll = -(Eigen::VectorXd(path_edge_i * y.head(n_i)));
+
+            auto toc2 = std::chrono::high_resolution_clock::now();
+            inverting_time += std::chrono::duration<double>(toc2 - tic2).count();
 
             // Update toll with projected gradient descent
             double lr = alpha * beta / (iter_num + beta);
